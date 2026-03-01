@@ -1,0 +1,72 @@
+{
+  "name": "file-scout",
+  "displayName": "File Scout",
+  "description": "Advanced search and intelligent filtering of files in VS Code Explorer. Find files quickly with Match Case, Regex, and smart exclude patterns.",
+  "version": "0.0.1",
+  "publisher": "Marabunta",
+  "keywords": [
+    "search",
+    "file search",
+    "file finder",
+    "explorer",
+    "filter",
+    "regex",
+    "navigation",
+    "productivity"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marabunta-labs/file-scout"
+  },
+  "bugs": {
+    "url": "https://github.com/marabunta-labs/file-scout/issues"
+  },
+  "homepage": "https://github.com/marabunta-labs/file-scout#readme",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "fileScoutView",
+          "name": "File Scout",
+          "visibility": "visible",
+          "when": "explorerViewletVisible",
+          "retainContextWhenHidden": true
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "file-scout.openFile",
+        "title": "File Scout: Open File"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.109.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.52.0",
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
