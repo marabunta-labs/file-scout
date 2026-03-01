@@ -2,7 +2,8 @@
   "name": "file-scout",
   "displayName": "File Scout",
   "description": "Advanced search and intelligent filtering of files in VS Code Explorer. Find files quickly with Match Case, Regex, and smart exclude patterns.",
-  "version": "0.0.1",
+  "version": "1.0.0",
+  "icon": "media/icon.png",
   "publisher": "Marabunta",
   "keywords": [
     "search",
@@ -48,6 +49,35 @@
       {
         "command": "file-scout.openFile",
         "title": "File Scout: Open File"
+      },
+      { 
+        "command": "file-scout.toggleMatchCase", 
+        "title": "Toggle Match Case" 
+      },
+      { 
+        "command": "file-scout.toggleMatchWholeWord", 
+        "title": "Toggle Whole Word" 
+      },
+      { 
+        "command": "file-scout.toggleRegex", 
+        "title": "Toggle Regex" 
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "file-scout.toggleMatchCase",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c"
+      },
+      {
+        "command": "file-scout.toggleMatchWholeWord",
+        "key": "ctrl+alt+w",
+        "mac": "cmd+alt+w"
+      },
+      {
+        "command": "file-scout.toggleRegex",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r"
       }
     ]
   },

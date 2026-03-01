@@ -7,7 +7,7 @@ interface FileDecorationProvider {
 
 export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'fileScoutView';
-    private _view?: vscode.WebviewView;
+    public _view?: vscode.WebviewView;
     private _lastQuery: string = '';
     private _lastOptions: any = {};
     private _lastResults: any[] = [];
@@ -777,7 +777,12 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     }
                     
                     // Update the exclude input (hidden from user, but used for search)
-                    const combinedPattern = excludePatterns.join(',');
+                    let combinedPattern = '';
+                    if (excludePatterns.length > 1) {
+                        combinedPattern = \`{\${excludePatterns.join(',')}}\`;
+                    } else if (excludePatterns.length === 1) {
+                        combinedPattern = excludePatterns[0];
+                    }
                     filesToExclude.dataset.effectivePattern = combinedPattern;
                     
                     // Re-search with new pattern
@@ -887,7 +892,14 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
 
                 window.addEventListener('message', event => {
                     const message = event.data;
-                    if (message.type === 'results') {
+                    console.log("Received message:", message.type);
+                    if (message.type === 'toggleMatchCase') {
+                        toggleOption('matchCase');
+                    } else if (message.type === 'toggleMatchWholeWord') {
+                        toggleOption('matchWholeWord');
+                    } else if (message.type === 'toggleRegex') {
+                        toggleOption('useRegex');
+                    } else if (message.type === 'results') {
                         displayResults(message.files);
                     } else if (message.type === 'restore') {
                         // Restore previous search state

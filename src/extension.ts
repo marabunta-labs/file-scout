@@ -60,6 +60,18 @@ export function activate(context: vscode.ExtensionContext) {
             await vscode.commands.executeCommand('revealInExplorer', uri);
         })
     );
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('file-scout.toggleMatchCase', () => {
+			provider._view?.webview.postMessage({ type: 'toggleMatchCase' });
+		}),
+		vscode.commands.registerCommand('file-scout.toggleMatchWholeWord', () => {
+			provider._view?.webview.postMessage({ type: 'toggleMatchWholeWord' });
+		}),
+		vscode.commands.registerCommand('file-scout.toggleRegex', () => {
+			provider._view?.webview.postMessage({ type: 'toggleRegex' });
+		})
+	);
 }
 
 export function deactivate() {}

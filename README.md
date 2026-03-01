@@ -4,6 +4,8 @@
 
 File Scout is a powerful VS Code extension that enhances your file navigation experience with advanced search capabilities right in your Explorer sidebar. Find files and folders quickly with smart filtering options similar to VS Code's native search, but optimized specifically for file and folder discovery.
 
+![File Scout Demo](media/filescout.gif)
+
 ## ✨ Features
 
 ### 🎯 Advanced Search Options
@@ -74,9 +76,12 @@ Click **📝 Open in Editor** to export all search results to a new markdown doc
 - **Click to Open**: Click any file in results to open it instantly
 - **Reveal Folder**: Click folder names to reveal them in the Explorer
 - **Keyboard Shortcuts**:
-  - `Alt+C`: Toggle Match Case
-  - `Alt+W`: Toggle Match Whole Word
-  - `Alt+R`: Toggle Regular Expression
+  - **Mac:** Option+Command+C: Toggle Match Case
+  - **Mac:** Option+Command+W: Toggle Match Whole Word
+  - **Mac:** Option+Command+R: Toggle Regular Expression
+  - **Windows/Linux:** Ctrl+Alt+C: Toggle Match Case
+  - **Windows/Linux:** Ctrl+Alt+W: Toggle Match Whole Word
+  - **Windows/Linux:** Ctrl+Alt+R: Toggle Regular Expression
 
 ### 💾 Persistent State
 
@@ -185,5 +190,5 @@ This extension is licensed under the MIT License.
 
 **Enjoy File Scout!** 🎉
 
-Made with ❤️ by Marabunta Labs
+Made with ❤️ by **[Marabunta Labs](https://github.com/marabunta-labs)**.
 
