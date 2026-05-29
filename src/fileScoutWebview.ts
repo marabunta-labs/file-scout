@@ -5,24 +5,46 @@ interface FileDecorationProvider {
     clearMatches(): void;
 }
 
+interface SearchOptions {
+    matchCase?: boolean;
+    matchWholeWord?: boolean;
+    useRegex?: boolean;
+    filesToInclude?: string;
+    filesToExclude?: string;
+}
+
+interface FileResult {
+    path: string;
+    fsPath: string;
+    fileName: string;
+    isFolder?: boolean;
+}
+
 export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'fileScoutView';
-    public _view?: vscode.WebviewView;
-    private _lastQuery: string = '';
-    private _lastOptions: any = {};
-    private _lastResults: any[] = [];
+    private _view?: vscode.WebviewView;
+    private _lastQuery = '';
+    private _lastOptions: SearchOptions = {};
+    private _lastResults: FileResult[] = [];
+    private _webviewReady = false;
+    private _searchGeneration = 0;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _decorationProvider: FileDecorationProvider
     ) { }
 
+    public postMessage(message: unknown): void {
+        this._view?.webview.postMessage(message);
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
-        context: vscode.WebviewViewResolveContext,
+        _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken,
     ) {
         this._view = webviewView;
+        this._webviewReady = false;
 
         webviewView.webview.options = {
             enableScripts: true,
@@ -31,82 +53,65 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
-        // Listen to visibility changes
         webviewView.onDidChangeVisibility(() => {
-            if (webviewView.visible && (this._lastResults.length > 0 || this._lastQuery)) {
-                // Restore file decorations
-                const matchingFilePaths = this._lastResults
-                    .filter(r => !r.isFolder)
-                    .map(r => r.fsPath);
-                this._decorationProvider.setMatchingFiles(matchingFilePaths);
-                
-                // Send the state back to rebuild the UI
-                setTimeout(() => {
-                    webviewView.webview.postMessage({ 
-                        type: 'restore', 
-                        query: this._lastQuery,
-                        options: this._lastOptions,
-                        files: this._lastResults
-                    });
-                }, 300);
+            if (webviewView.visible && this._lastResults.length > 0) {
+                this._restoreState();
             }
         });
 
-        // Initial restore on first load
-        if (this._lastResults.length > 0 || this._lastQuery) {
-            // Restore file decorations first
-            const matchingFilePaths = this._lastResults
-                .filter(r => !r.isFolder)
-                .map(r => r.fsPath);
-            this._decorationProvider.setMatchingFiles(matchingFilePaths);
-            
-            // Send the state back to rebuild the UI
-            setTimeout(() => {
-                webviewView.webview.postMessage({ 
-                    type: 'restore', 
-                    query: this._lastQuery,
-                    options: this._lastOptions,
-                    files: this._lastResults
-                });
-            }, 300);
-        }
-
-        // Escuchar mensajes desde el webview
         webviewView.webview.onDidReceiveMessage(async data => {
             switch (data.type) {
+                case 'ready':
+                    this._webviewReady = true;
+                    if (this._lastResults.length > 0 || this._lastQuery) {
+                        this._restoreState();
+                    }
+                    break;
                 case 'search':
-                    // Save query and options for state restoration
                     this._lastQuery = data.query;
                     this._lastOptions = data.options || {};
-                    await this.performSearch(data.query, data.options);
+                    await this._performSearch(data.query, data.options);
                     break;
-                case 'openFile':
+                case 'openFile': {
                     const uri = vscode.Uri.file(data.fsPath);
                     await vscode.window.showTextDocument(uri);
                     break;
-                case 'revealFolder':
+                }
+                case 'revealFolder': {
                     const folderUri = vscode.Uri.file(data.fsPath);
                     await vscode.commands.executeCommand('revealInExplorer', folderUri);
                     break;
-                case 'openInEditor':
-                    // Create a new untitled document with the results
+                }
+                case 'openInEditor': {
                     const document = await vscode.workspace.openTextDocument({
                         content: data.content,
                         language: 'markdown'
                     });
                     await vscode.window.showTextDocument(document);
                     break;
+                }
             }
         });
     }
 
-    private async performSearch(query: string, options?: {
-        matchCase?: boolean;
-        matchWholeWord?: boolean;
-        useRegex?: boolean;
-        filesToInclude?: string;
-        filesToExclude?: string;
-    }) {
+    private _restoreState(): void {
+        if (!this._webviewReady) { return; }
+        const matchingFilePaths = this._lastResults
+            .filter(r => !r.isFolder)
+            .map(r => r.fsPath);
+        this._decorationProvider.setMatchingFiles(matchingFilePaths);
+
+        this._view?.webview.postMessage({
+            type: 'restore',
+            query: this._lastQuery,
+            options: this._lastOptions,
+            files: this._lastResults
+        });
+    }
+
+    private async _performSearch(query: string, options?: SearchOptions): Promise<void> {
+        const generation = ++this._searchGeneration;
+
         if (!query || query.trim() === '') {
             this._decorationProvider.clearMatches();
             this._lastResults = [];
@@ -115,103 +120,71 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
         }
 
         const includePattern = options?.filesToInclude || '**/*';
-        const excludePattern = options?.filesToExclude || '';
-        
+        const excludePattern = options?.filesToExclude || undefined;
+
         try {
-            // Get all files matching the include/exclude patterns
             const foundFiles = await vscode.workspace.findFiles(
                 includePattern,
-                excludePattern || undefined,
+                excludePattern,
                 2000
             );
 
-            // Build search pattern for filename matching
             let searchPattern: RegExp;
             try {
                 if (options?.useRegex) {
                     const flags = options?.matchCase ? '' : 'i';
                     searchPattern = new RegExp(query, flags);
                 } else {
-                    // Escape special regex characters
                     let escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                    
+
                     if (options?.matchWholeWord) {
-                        // For filenames, whole word means exact name match (before extension)
                         escapedQuery = `^${escapedQuery}(\\.|$)`;
                     }
-                    
+
                     const flags = options?.matchCase ? '' : 'i';
                     searchPattern = new RegExp(escapedQuery, flags);
                 }
-            } catch (e) {
-                // Invalid regex, return empty results
+            } catch {
+                if (generation !== this._searchGeneration) { return; }
                 this._lastResults = [];
                 this._view?.webview.postMessage({ type: 'results', files: [] });
                 return;
             }
 
-            // Filter files: include if filename matches OR folder name matches (but smartly)
-            const results: any[] = [];
+            const results: FileResult[] = [];
             const matchingFolderPaths = new Set<string>();
-            
-            // First pass: find all folders that match the pattern
-            foundFiles.forEach(uri => {
+
+            // First pass: find matching folders
+            for (const uri of foundFiles) {
                 const relativePath = vscode.workspace.asRelativePath(uri);
                 const pathParts = relativePath.split('/');
-                
-                // Check each folder in the path
+
                 for (let i = 0; i < pathParts.length - 1; i++) {
-                    const folderName = pathParts[i];
-                    if (searchPattern.test(folderName)) {
-                        // Store the full path to this matching folder
+                    if (searchPattern.test(pathParts[i])) {
                         const folderPath = pathParts.slice(0, i + 1).join('/');
                         matchingFolderPaths.add(folderPath);
                     }
                 }
-            });
-            
-            // Track which matching folders have files
-            const foldersWithMatchingFiles = new Set<string>();
-            
-            // Second pass: include files based on matching criteria
-            foundFiles.forEach(uri => {
+            }
+
+            // Second pass: find matching files
+            for (const uri of foundFiles) {
                 const relativePath = vscode.workspace.asRelativePath(uri);
                 const fileName = uri.path.split('/').pop() || '';
-                
-                // Check if filename matches
-                const fileNameMatches = searchPattern.test(fileName);
-                
-                // Check if file is directly inside a matching folder
-                let matchingFolderPath: string | null = null;
-                for (const folderPath of matchingFolderPaths) {
-                    if (relativePath.startsWith(folderPath + '/')) {
-                        matchingFolderPath = folderPath;
-                        break;
-                    }
-                }
-                
-                // Include file if:
-                // 1. Filename matches (regardless of folder)
-                // 2. File is inside a matching folder AND the filename also matches
-                if (fileNameMatches) {
+
+                if (searchPattern.test(fileName)) {
                     results.push({
                         path: relativePath,
                         fsPath: uri.fsPath,
-                        fileName: fileName
+                        fileName
                     });
-                    
-                    // Mark this folder as having matching files
-                    if (matchingFolderPath) {
-                        foldersWithMatchingFiles.add(matchingFolderPath);
-                    }
                 }
-            });
-            
-            // Third pass: add all matching folders as folder entries
-            for (const folderPath of matchingFolderPaths) {
-                // Add folder entry (regardless of whether it has matching files)
-                const workspaceFolders = vscode.workspace.workspaceFolders;
-                if (workspaceFolders && workspaceFolders.length > 0) {
+            }
+
+            // Third pass: add matching folders
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (workspaceFolders && workspaceFolders.length > 0) {
+                for (const folderPath of matchingFolderPaths) {
                     const folderUri = vscode.Uri.joinPath(workspaceFolders[0].uri, folderPath);
                     results.push({
                         path: folderPath,
@@ -222,7 +195,10 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 }
             }
 
-            // Update file decorations in Explorer
+            // Discard stale results if a newer search was started
+            if (generation !== this._searchGeneration) { return; }
+
+            // Update decorations
             const matchingFilePaths = results
                 .filter(r => !r.isFolder)
                 .map(r => r.fsPath);
@@ -231,19 +207,23 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
             this._lastResults = results;
             this._view?.webview.postMessage({ type: 'results', files: results });
         } catch (error) {
-            console.error('Search error:', error);
+            if (generation !== this._searchGeneration) { return; }
+            console.error('File Scout search error:', error);
             this._decorationProvider.clearMatches();
             this._lastResults = [];
             this._view?.webview.postMessage({ type: 'results', files: [] });
         }
     }
 
-    private _getHtmlForWebview(webview: vscode.Webview) {
+    private _getHtmlForWebview(_webview: vscode.Webview): string {
+        const nonce = getNonce();
+
         return `<!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
             <title>File Scout</title>
             <style>
                 body {
@@ -309,6 +289,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     right: 4px;
                     display: flex;
                     gap: 2px;
+                    z-index: 1;
                 }
                 .option-button {
                     width: 24px;
@@ -427,9 +408,6 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     color: var(--vscode-descriptionForeground);
                     margin: 8px 0 2px 0;
                 }
-                .exclude-options {
-                    margin: 8px 0;
-                }
                 .exclude-option {
                     display: flex;
                     align-items: center;
@@ -530,19 +508,6 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     color: var(--vscode-descriptionForeground);
                     opacity: 0.8;
                 }
-                .action-button {
-                    padding: 2px 6px;
-                    font-size: 11px;
-                    background: var(--vscode-button-secondaryBackground);
-                    color: var(--vscode-button-secondaryForeground);
-                    border: none;
-                    border-radius: 2px;
-                    cursor: pointer;
-                    margin-left: 4px;
-                }
-                .action-button:hover {
-                    background: var(--vscode-button-secondaryHoverBackground);
-                }
             </style>
         </head>
         <body>
@@ -559,27 +524,25 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                         <button 
                             class="option-button" 
                             id="btnMatchCase"
-                            title="Match Case - Case sensitive search (Alt+C)"
-                            onclick="toggleOption('matchCase')"
+                            title="Match Case (Alt+C)"
                         >Aa</button>
                         <button 
                             class="option-button" 
                             id="btnMatchWord"
-                            title="Match Whole Word - Match exact filename (Alt+W)"
-                            onclick="toggleOption('matchWholeWord')"
+                            title="Match Whole Word: match exact filename (Alt+W)"
+                            aria-label="Match Whole Word"
                         >Ab</button>
                         <button 
                             class="option-button" 
                             id="btnUseRegex"
                             title="Use Regular Expression (Alt+R)"
-                            onclick="toggleOption('useRegex')"
                         >.*</button>
                     </div>
                 </div>
                 
                 <div class="filters-section">
-                    <div class="filter-toggle" onclick="toggleFilters()" title="Toggle Search Details">
-                        <span style="font-size: 16px; font-weight: bold;">⋯</span>
+                    <div class="filter-toggle" id="filterToggleBtn" title="Toggle Search Details">
+                        <span style="font-size: 16px; font-weight: bold;">&#x22EF;</span>
                     </div>
                     <div class="filter-inputs" id="filterInputs">
                         <div class="filter-label">Files to include</div>
@@ -590,40 +553,40 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                             placeholder="e.g., **/*.ts, src/**"
                         />
                         <div class="filter-label" style="margin-top: 12px;">Files to exclude</div>
-                        <div class="exclude-toggle" onclick="toggleExcludeOptions()">
-                            ▶ Common folders to exclude
+                        <div class="exclude-toggle" id="excludeToggleBtn">
+                            &#x25B6; Common folders to exclude
                         </div>
                         <div class="exclude-checkboxes" id="excludeCheckboxes">
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-node-modules" checked onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-node-modules" checked>
                                 <label class="exclude-label" for="exclude-node-modules">node_modules/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-dist" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-dist">
                                 <label class="exclude-label" for="exclude-dist">dist/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-build" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-build">
                                 <label class="exclude-label" for="exclude-build">build/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-out" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-out">
                                 <label class="exclude-label" for="exclude-out">out/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-git" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-git">
                                 <label class="exclude-label" for="exclude-git">.git/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-vscode" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-vscode">
                                 <label class="exclude-label" for="exclude-vscode">.vscode/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-coverage" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-coverage">
                                 <label class="exclude-label" for="exclude-coverage">coverage/</label>
                             </div>
                             <div class="exclude-option">
-                                <input type="checkbox" class="exclude-checkbox" id="exclude-temp" onchange="updateExcludePattern()">
+                                <input type="checkbox" class="exclude-checkbox" id="exclude-temp">
                                 <label class="exclude-label" for="exclude-temp">temp/, tmp/</label>
                             </div>
                         </div>
@@ -634,30 +597,29 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                             placeholder="Custom pattern: e.g., **/*.test.ts"
                         />
                     </div>
-                </div>                
+                </div>
                 <div class="view-options">
                     <button 
                         class="view-toggle" 
                         id="btnViewToggle"
                         title="Toggle Tree/List View"
-                        onclick="toggleViewMode()"
-                    >🌳</button>
+                    >&#x1F333;</button>
                     <span class="results-count" id="resultsCount"></span>
                     <button 
                         class="open-editor-button" 
                         id="btnOpenEditor"
                         title="Open results in editor"
-                        onclick="openInEditor()"
                         style="display: none;"
-                    >📝 Open in Editor</button>
-                </div>            </div>
+                    >&#x1F4DD; Open in Editor</button>
+                </div>
+            </div>
             <div class="results-container" id="results">
                 <div class="welcome">
-                    � Search for files and folders by name
+                    &#x1F50D; Search for files and folders by name
                 </div>
             </div>
 
-            <script>
+            <script nonce="${nonce}">
                 const vscode = acquireVsCodeApi();
                 const searchInput = document.getElementById('searchInput');
                 const resultsContainer = document.getElementById('results');
@@ -670,212 +632,196 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     matchWholeWord: false,
                     useRegex: false
                 };
-                let viewMode = 'tree'; // 'tree' or 'list'
-                let currentFiles = []; // Store current results
+                let viewMode = 'tree';
+                let currentFiles = [];
+
+                function escapeHtml(str) {
+                    const div = document.createElement('div');
+                    div.textContent = str;
+                    return div.innerHTML;
+                }
 
                 function toggleViewMode() {
                     viewMode = viewMode === 'tree' ? 'list' : 'tree';
+                    const btn = document.getElementById('btnViewToggle');
+                    btn.innerHTML = viewMode === 'tree' ? '&#x1F333;' : '&#x1F4C4;';
+                    btn.title = viewMode === 'tree' ? 'Switch to List View' : 'Switch to Tree View';
                     
-                    // Update button icon
-                    document.getElementById('btnViewToggle').textContent = viewMode === 'tree' ? '🌳' : '📄';
-                    document.getElementById('btnViewToggle').title = viewMode === 'tree' ? 'Switch to List View' : 'Switch to Tree View';
-                    
-                    // Re-render current results
                     if (currentFiles.length > 0) {
                         displayResults(currentFiles);
                     }
                 }
 
                 function updateResultsCount(files) {
-                    const fileCount = files.filter(f => !f.isFolder).length;
-                    const folderCount = files.filter(f => f.isFolder).length;
+                    const fileCount = files.filter(function(f) { return !f.isFolder; }).length;
+                    const folderCount = files.filter(function(f) { return f.isFolder; }).length;
                     
-                    const countText = [];
-                    if (fileCount > 0) countText.push(\`\${fileCount} file\${fileCount !== 1 ? 's' : ''}\`);
-                    if (folderCount > 0) countText.push(\`\${folderCount} folder\${folderCount !== 1 ? 's' : ''}\`);
+                    const parts = [];
+                    if (fileCount > 0) parts.push(fileCount + ' file' + (fileCount !== 1 ? 's' : ''));
+                    if (folderCount > 0) parts.push(folderCount + ' folder' + (folderCount !== 1 ? 's' : ''));
                     
-                    document.getElementById('resultsCount').textContent = countText.join(', ');
-                    
-                    // Show/hide "Open in Editor" button
+                    document.getElementById('resultsCount').textContent = parts.join(', ');
                     document.getElementById('btnOpenEditor').style.display = files.length > 0 ? 'flex' : 'none';
                 }
 
                 function openInEditor() {
                     if (currentFiles.length === 0) return;
                     
-                    // Create content for the editor
-                    let content = \`# File Scout Search Results\\n\`;
-                    content += \`# Query: "\${searchInput.value}"\\n\`;
-                    content += \`# Found \${currentFiles.length} result\${currentFiles.length !== 1 ? 's' : ''}\\n\`;
-                    content += \`\\n\`;
+                    let content = '# File Scout Search Results\\n';
+                    content += '# Query: "' + searchInput.value + '"\\n';
+                    content += '# Found ' + currentFiles.length + ' result' + (currentFiles.length !== 1 ? 's' : '') + '\\n\\n';
                     
-                    currentFiles.forEach(file => {
+                    currentFiles.forEach(function(file) {
                         if (file.isFolder) {
-                            content += \`📁 \${file.path}/\\n\`;
+                            content += '\\uD83D\\uDCC1 ' + file.path + '/\\n';
                         } else {
-                            content += \`📄 \${file.path}\\n\`;
+                            content += '\\uD83D\\uDCC4 ' + file.path + '\\n';
                         }
                     });
                     
-                    vscode.postMessage({ 
-                        type: 'openInEditor', 
-                        content: content,
-                        language: 'markdown'
-                    });
+                    vscode.postMessage({ type: 'openInEditor', content: content });
                 }
 
-                // Initialize exclude pattern from checkboxes
                 function initializeExcludePattern() {
                     updateExcludePattern();
                 }
 
-                function toggleExcludeOptions() {
+                function toggleExcludeOptions(evt) {
                     const checkboxesDiv = document.getElementById('excludeCheckboxes');
-                    const toggle = event.target;
+                    const toggle = evt.currentTarget;
                     
                     if (checkboxesDiv.classList.contains('expanded')) {
                         checkboxesDiv.classList.remove('expanded');
-                        toggle.textContent = '▶ Common folders to exclude';
+                        toggle.innerHTML = '&#x25B6; Common folders to exclude';
                     } else {
                         checkboxesDiv.classList.add('expanded');
-                        toggle.textContent = '▼ Common folders to exclude';
+                        toggle.innerHTML = '&#x25BC; Common folders to exclude';
                     }
                 }
 
                 function updateExcludePattern() {
                     const excludePatterns = [];
                     
-                    if (document.getElementById('exclude-node-modules').checked) {
-                        excludePatterns.push('**/node_modules/**');
-                    }
-                    if (document.getElementById('exclude-dist').checked) {
-                        excludePatterns.push('**/dist/**');
-                    }
-                    if (document.getElementById('exclude-build').checked) {
-                        excludePatterns.push('**/build/**');
-                    }
-                    if (document.getElementById('exclude-out').checked) {
-                        excludePatterns.push('**/out/**');
-                    }
-                    if (document.getElementById('exclude-git').checked) {
-                        excludePatterns.push('**/.git/**');
-                    }
-                    if (document.getElementById('exclude-vscode').checked) {
-                        excludePatterns.push('**/.vscode/**');
-                    }
-                    if (document.getElementById('exclude-coverage').checked) {
-                        excludePatterns.push('**/coverage/**');
-                    }
+                    if (document.getElementById('exclude-node-modules').checked) excludePatterns.push('**/node_modules/**');
+                    if (document.getElementById('exclude-dist').checked) excludePatterns.push('**/dist/**');
+                    if (document.getElementById('exclude-build').checked) excludePatterns.push('**/build/**');
+                    if (document.getElementById('exclude-out').checked) excludePatterns.push('**/out/**');
+                    if (document.getElementById('exclude-git').checked) excludePatterns.push('**/.git/**');
+                    if (document.getElementById('exclude-vscode').checked) excludePatterns.push('**/.vscode/**');
+                    if (document.getElementById('exclude-coverage').checked) excludePatterns.push('**/coverage/**');
                     if (document.getElementById('exclude-temp').checked) {
-                        excludePatterns.push('**/temp/**', '**/tmp/**');
+                        excludePatterns.push('**/temp/**');
+                        excludePatterns.push('**/tmp/**');
                     }
                     
-                    // Add custom pattern if any
                     const customPattern = filesToExclude.value.trim();
                     if (customPattern) {
                         excludePatterns.push(customPattern);
                     }
                     
-                    // Update the exclude input (hidden from user, but used for search)
                     let combinedPattern = '';
                     if (excludePatterns.length > 1) {
-                        combinedPattern = \`{\${excludePatterns.join(',')}}\`;
+                        combinedPattern = '{' + excludePatterns.join(',') + '}';
                     } else if (excludePatterns.length === 1) {
                         combinedPattern = excludePatterns[0];
                     }
                     filesToExclude.dataset.effectivePattern = combinedPattern;
                     
-                    // Re-search with new pattern
                     if (searchInput.value.trim()) {
                         performSearch();
                     }
                 }
 
                 function toggleOption(option) {
-                    const btnId = option === 'matchCase' ? 'btnMatchCase' : 
-                                  option === 'matchWholeWord' ? 'btnMatchWord' : 'btnUseRegex';
-                    const button = document.getElementById(btnId);
-                    
-                    // If this option is already active, deactivate it
-                    if (searchOptions[option]) {
-                        searchOptions[option] = false;
-                        if (button) button.classList.remove('active');
-                    } else {
-                        // Deactivate all options first (they are mutually exclusive)
-                        const allOptions = ['matchCase', 'matchWholeWord', 'useRegex'];
-                        allOptions.forEach(opt => {
-                            searchOptions[opt] = false;
-                            const optBtnId = opt === 'matchCase' ? 'btnMatchCase' : 
-                                          opt === 'matchWholeWord' ? 'btnMatchWord' : 'btnUseRegex';
-                            const btn = document.getElementById(optBtnId);
-                            if (btn) btn.classList.remove('active');
-                        });
-                        
-                        // Activate the selected option
-                        searchOptions[option] = true;
-                        if (button) button.classList.add('active');
+                    if (option === 'useRegex') {
+                        if (searchOptions.useRegex) {
+                            searchOptions.useRegex = false;
+                            document.getElementById('btnUseRegex').classList.remove('active');
+                        } else {
+                            searchOptions.useRegex = true;
+                            searchOptions.matchWholeWord = false;
+                            document.getElementById('btnUseRegex').classList.add('active');
+                            document.getElementById('btnMatchWord').classList.remove('active');
+                        }
+                    } else if (option === 'matchWholeWord') {
+                        if (searchOptions.matchWholeWord) {
+                            searchOptions.matchWholeWord = false;
+                            document.getElementById('btnMatchWord').classList.remove('active');
+                        } else {
+                            searchOptions.matchWholeWord = true;
+                            searchOptions.useRegex = false;
+                            document.getElementById('btnMatchWord').classList.add('active');
+                            document.getElementById('btnUseRegex').classList.remove('active');
+                        }
+                    } else if (option === 'matchCase') {
+                        searchOptions.matchCase = !searchOptions.matchCase;
+                        if (searchOptions.matchCase) {
+                            document.getElementById('btnMatchCase').classList.add('active');
+                        } else {
+                            document.getElementById('btnMatchCase').classList.remove('active');
+                        }
                     }
                     
-                    // Re-search with new options
                     performSearch();
                 }
 
                 function toggleFilters() {
-                    const filterInputs = document.getElementById('filterInputs');
-                    
-                    if (filterInputs.classList.contains('expanded')) {
-                        filterInputs.classList.remove('expanded');
-                    } else {
-                        filterInputs.classList.add('expanded');
-                    }
+                    document.getElementById('filterInputs').classList.toggle('expanded');
                 }
 
                 function performSearch() {
                     const query = searchInput.value;
                     const effectiveExclude = filesToExclude.dataset.effectivePattern || '';
-                    const options = {
-                        ...searchOptions,
-                        filesToInclude: filesToInclude.value.trim(),
-                        filesToExclude: effectiveExclude
-                    };
-                    
                     vscode.postMessage({ 
                         type: 'search', 
-                        query,
-                        options 
+                        query: query,
+                        options: {
+                            matchCase: searchOptions.matchCase,
+                            matchWholeWord: searchOptions.matchWholeWord,
+                            useRegex: searchOptions.useRegex,
+                            filesToInclude: filesToInclude.value.trim(),
+                            filesToExclude: effectiveExclude
+                        }
                     });
                 }
 
-                searchInput.addEventListener('input', (e) => {
+                searchInput.addEventListener('input', function() {
                     clearTimeout(searchTimeout);
-                    searchTimeout = setTimeout(() => {
-                        performSearch();
-                    }, 300);
+                    searchTimeout = setTimeout(performSearch, 300);
                 });
 
-                searchInput.addEventListener('keypress', (e) => {
+                searchInput.addEventListener('keypress', function(e) {
                     if (e.key === 'Enter') {
                         clearTimeout(searchTimeout);
                         performSearch();
                     }
                 });
 
-                filesToInclude.addEventListener('input', () => {
+                filesToInclude.addEventListener('input', function() {
                     clearTimeout(searchTimeout);
-                    searchTimeout = setTimeout(() => {
-                        performSearch();
-                    }, 500);
+                    searchTimeout = setTimeout(performSearch, 500);
                 });
 
-                filesToExclude.addEventListener('input', () => {
+                filesToExclude.addEventListener('input', function() {
                     clearTimeout(searchTimeout);
-                    searchTimeout = setTimeout(() => {
-                        updateExcludePattern();
-                    }, 500);
+                    searchTimeout = setTimeout(updateExcludePattern, 500);
+                });
+
+                // Button event listeners (no inline onclick)
+                document.getElementById('btnMatchCase').addEventListener('click', function() { toggleOption('matchCase'); });
+                document.getElementById('btnMatchWord').addEventListener('click', function() { toggleOption('matchWholeWord'); });
+                document.getElementById('btnUseRegex').addEventListener('click', function() { toggleOption('useRegex'); });
+                document.getElementById('btnViewToggle').addEventListener('click', toggleViewMode);
+                document.getElementById('btnOpenEditor').addEventListener('click', openInEditor);
+                document.getElementById('filterToggleBtn').addEventListener('click', toggleFilters);
+                document.getElementById('excludeToggleBtn').addEventListener('click', function(evt) { toggleExcludeOptions(evt); });
+
+                document.querySelectorAll('.exclude-checkbox').forEach(function(cb) {
+                    cb.addEventListener('change', updateExcludePattern);
                 });
 
                 // Keyboard shortcuts
-                document.addEventListener('keydown', (e) => {
+                document.addEventListener('keydown', function(e) {
                     if (e.altKey) {
                         if (e.key === 'c' || e.key === 'C') {
                             e.preventDefault();
@@ -890,9 +836,8 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     }
                 });
 
-                window.addEventListener('message', event => {
+                window.addEventListener('message', function(event) {
                     const message = event.data;
-                    console.log("Received message:", message.type);
                     if (message.type === 'toggleMatchCase') {
                         toggleOption('matchCase');
                     } else if (message.type === 'toggleMatchWholeWord') {
@@ -902,33 +847,32 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     } else if (message.type === 'results') {
                         displayResults(message.files);
                     } else if (message.type === 'restore') {
-                        // Restore previous search state
                         searchInput.value = message.query || '';
                         
-                        // Clear all active states first
-                        document.querySelectorAll('.option-button.active').forEach(btn => {
+                        document.querySelectorAll('.option-button.active').forEach(function(btn) {
                             btn.classList.remove('active');
                         });
                         
-                        // Restore options
+                        searchOptions = { matchCase: false, matchWholeWord: false, useRegex: false };
+                        
                         if (message.options) {
                             if (message.options.matchCase) {
+                                searchOptions.matchCase = true;
                                 document.getElementById('btnMatchCase').classList.add('active');
                             }
                             if (message.options.matchWholeWord) {
+                                searchOptions.matchWholeWord = true;
                                 document.getElementById('btnMatchWord').classList.add('active');
                             }
                             if (message.options.useRegex) {
+                                searchOptions.useRegex = true;
                                 document.getElementById('btnUseRegex').classList.add('active');
                             }
                             if (message.options.filesToInclude) {
                                 filesToInclude.value = message.options.filesToInclude;
                             }
                             if (message.options.filesToExclude) {
-                                // Restore exclude pattern and update checkboxes accordingly
                                 const excludePattern = message.options.filesToExclude;
-                                
-                                // Check which patterns are included
                                 document.getElementById('exclude-node-modules').checked = excludePattern.includes('node_modules');
                                 document.getElementById('exclude-dist').checked = excludePattern.includes('**/dist/**');
                                 document.getElementById('exclude-build').checked = excludePattern.includes('**/build/**');
@@ -937,24 +881,10 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                                 document.getElementById('exclude-vscode').checked = excludePattern.includes('.vscode');
                                 document.getElementById('exclude-coverage').checked = excludePattern.includes('**/coverage/**');
                                 document.getElementById('exclude-temp').checked = excludePattern.includes('**/temp/**') || excludePattern.includes('**/tmp/**');
-                                
-                                // Extract custom pattern (anything that's not a checkbox pattern)
-                                const standardPatterns = [
-                                    '**/node_modules/**', '**/dist/**', '**/build/**', '**/out/**',
-                                    '**/.git/**', '**/.vscode/**', '**/coverage/**', '**/temp/**', '**/tmp/**'
-                                ];
-                                const patterns = excludePattern.split(',').map(p => p.trim());
-                                const customPatterns = patterns.filter(p => !standardPatterns.includes(p));
-                                if (customPatterns.length > 0) {
-                                    filesToExclude.value = customPatterns.join(', ');
-                                }
-                                
-                                // Update the effective pattern
-                                updateExcludePattern();
+                                filesToExclude.dataset.effectivePattern = excludePattern;
                             }
                         }
                         
-                        // Restore results
                         if (message.files && message.files.length > 0) {
                             displayResults(message.files);
                         }
@@ -962,23 +892,20 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 });
 
                 function displayResults(files) {
-                    // Store current results
                     currentFiles = files;
                     
                     if (files.length === 0) {
                         updateResultsCount([]);
                         if (searchInput.value.trim() === '') {
-                            resultsContainer.innerHTML = '<div class="welcome">� Search for files and folders by name</div>';
+                            resultsContainer.innerHTML = '<div class="welcome">&#x1F50D; Search for files and folders by name</div>';
                         } else {
                             resultsContainer.innerHTML = '<div class="no-results">No files found</div>';
                         }
                         return;
                     }
 
-                    // Update results count
                     updateResultsCount(files);
 
-                    // Render based on view mode
                     if (viewMode === 'tree') {
                         const tree = buildFileTree(files);
                         resultsContainer.innerHTML = renderTree(tree);
@@ -988,24 +915,20 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 }
 
                 function renderList(files) {
-                    return files.map(file => {
+                    return files.map(function(file) {
                         if (file.isFolder) {
-                            return \`
-                                <div class="list-item" onclick="revealFolder('\${file.fsPath}')" title="Click to reveal in Explorer">
-                                    <span class="icon-folder" style="font-size: 16px;">📁</span>
-                                    <span>\${file.fileName}</span>
-                                    <span class="list-item-path">\${file.path}</span>
-                                </div>
-                            \`;
+                            return '<div class="list-item" data-action="revealFolder" data-path="' + escapeHtml(file.fsPath) + '" title="Click to reveal in Explorer">' +
+                                '<span class="icon-folder" style="font-size: 16px;">&#x1F4C1;</span>' +
+                                '<span>' + escapeHtml(file.fileName) + '</span>' +
+                                '<span class="list-item-path">' + escapeHtml(file.path) + '</span>' +
+                                '</div>';
                         } else {
                             const icon = getFileIcon(file.fileName);
-                            return \`
-                                <div class="list-item" onclick="openFile('\${file.fsPath}')" title="Click to open file">
-                                    <span class="file-icon \${icon.class}">\${icon.text}</span>
-                                    <span>\${file.fileName}</span>
-                                    <span class="list-item-path">\${file.path}</span>
-                                </div>
-                            \`;
+                            return '<div class="list-item" data-action="openFile" data-path="' + escapeHtml(file.fsPath) + '" title="Click to open file">' +
+                                '<span class="file-icon ' + icon.cssClass + '">' + icon.text + '</span>' +
+                                '<span>' + escapeHtml(file.fileName) + '</span>' +
+                                '<span class="list-item-path">' + escapeHtml(file.path) + '</span>' +
+                                '</div>';
                         }
                     }).join('');
                 }
@@ -1013,25 +936,17 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 function buildFileTree(files) {
                     const tree = {};
                     
-                    // Get workspace base path from first file
                     let workspaceBasePath = '';
-                    if (files.length > 0 && !files[0].isFolder) {
-                        const firstFilePath = files[0].fsPath;
-                        const relativePath = files[0].path;
-                        workspaceBasePath = firstFilePath.substring(0, firstFilePath.length - relativePath.length);
-                    } else if (files.length > 0 && files[0].isFolder) {
-                        const folderPath = files[0].fsPath;
-                        const relativePath = files[0].path;
-                        workspaceBasePath = folderPath.substring(0, folderPath.length - relativePath.length);
+                    if (files.length > 0) {
+                        const first = files[0];
+                        workspaceBasePath = first.fsPath.substring(0, first.fsPath.length - first.path.length);
                     }
                     
-                    files.forEach(file => {
+                    files.forEach(function(file) {
                         if (file.isFolder) {
-                            // This is a matching folder with no matching files
                             const parts = file.path.split('/');
                             let current = tree;
                             
-                            // Build folder structure up to this folder
                             for (let i = 0; i < parts.length; i++) {
                                 const folder = parts[i];
                                 const folderPath = parts.slice(0, i + 1).join('/');
@@ -1052,12 +967,10 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                                 current = current[folder].__children;
                             }
                         } else {
-                            // This is a file
                             const parts = file.path.split('/');
                             let current = tree;
                             let currentPath = '';
                             
-                            // Build folder structure
                             for (let i = 0; i < parts.length - 1; i++) {
                                 const folder = parts[i];
                                 currentPath = currentPath ? currentPath + '/' + folder : folder;
@@ -1075,7 +988,6 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                                 current = current[folder].__children;
                             }
                             
-                            // Add file
                             const fileName = parts[parts.length - 1];
                             current[fileName] = { __type: 'file', __data: file };
                         }
@@ -1085,50 +997,51 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 }
 
                 function getFileIcon(fileName) {
-                    const ext = fileName.split('.').pop()?.toLowerCase() || '';
+                    const ext = (fileName.split('.').pop() || '').toLowerCase();
                     const lowerFileName = fileName.toLowerCase();
                     
-                    // Special files
-                    if (lowerFileName === 'package.json') return { class: 'icon-json', text: '📦' };
-                    if (lowerFileName === 'package-lock.json') return { class: 'icon-json', text: '🔒' };
-                    if (lowerFileName === 'tsconfig.json') return { class: 'icon-json', text: '⚙️' };
-                    if (lowerFileName === 'readme.md') return { class: 'icon-md', text: '📘' };
-                    if (lowerFileName.startsWith('.git')) return { class: 'icon-git', text: 'git' };
-                    if (lowerFileName === 'dockerfile') return { class: 'icon-default', text: '🐳' };
-                    if (lowerFileName === '.env') return { class: 'icon-default', text: '🔐' };
+                    if (lowerFileName === 'package.json') return { cssClass: 'icon-json', text: '&#x1F4E6;' };
+                    if (lowerFileName === 'package-lock.json') return { cssClass: 'icon-json', text: '&#x1F512;' };
+                    if (lowerFileName === 'tsconfig.json') return { cssClass: 'icon-json', text: '&#x2699;' };
+                    if (lowerFileName === 'readme.md') return { cssClass: 'icon-md', text: '&#x1F4D8;' };
+                    if (lowerFileName.startsWith('.git')) return { cssClass: 'icon-git', text: 'git' };
+                    if (lowerFileName === 'dockerfile') return { cssClass: 'icon-default', text: '&#x1F433;' };
+                    if (lowerFileName === '.env') return { cssClass: 'icon-default', text: '&#x1F510;' };
                     
-                    // Extensions with colored badges
                     const iconMap = {
-                        'ts': { class: 'icon-ts', text: 'TS' },
-                        'tsx': { class: 'icon-tsx', text: 'TS' },
-                        'js': { class: 'icon-js', text: 'JS' },
-                        'jsx': { class: 'icon-jsx', text: 'JS' },
-                        'mjs': { class: 'icon-js', text: 'JS' },
-                        'cjs': { class: 'icon-js', text: 'JS' },
-                        'json': { class: 'icon-json', text: '{}' },
-                        'html': { class: 'icon-html', text: 'H' },
-                        'htm': { class: 'icon-html', text: 'H' },
-                        'css': { class: 'icon-css', text: 'C' },
-                        'scss': { class: 'icon-scss', text: 'S' },
-                        'sass': { class: 'icon-scss', text: 'S' },
-                        'less': { class: 'icon-scss', text: 'L' },
-                        'md': { class: 'icon-md', text: 'M' },
-                        'markdown': { class: 'icon-md', text: 'M' },
-                        'py': { class: 'icon-py', text: 'Py' },
-                        'xml': { class: 'icon-xml', text: 'X' },
-                        'svg': { class: 'icon-svg', text: '⬡' },
-                        'yml': { class: 'icon-default', text: 'Y' },
-                        'yaml': { class: 'icon-default', text: 'Y' },
-                        'txt': { class: 'icon-default', text: '📝' },
-                        'sh': { class: 'icon-default', text: '$' },
-                        'gitignore': { class: 'icon-git', text: 'git' },
+                        'ts': { cssClass: 'icon-ts', text: 'TS' },
+                        'tsx': { cssClass: 'icon-tsx', text: 'TS' },
+                        'js': { cssClass: 'icon-js', text: 'JS' },
+                        'jsx': { cssClass: 'icon-jsx', text: 'JS' },
+                        'mjs': { cssClass: 'icon-js', text: 'JS' },
+                        'cjs': { cssClass: 'icon-js', text: 'JS' },
+                        'json': { cssClass: 'icon-json', text: '{}' },
+                        'html': { cssClass: 'icon-html', text: 'H' },
+                        'htm': { cssClass: 'icon-html', text: 'H' },
+                        'css': { cssClass: 'icon-css', text: 'C' },
+                        'scss': { cssClass: 'icon-scss', text: 'S' },
+                        'sass': { cssClass: 'icon-scss', text: 'S' },
+                        'less': { cssClass: 'icon-scss', text: 'L' },
+                        'md': { cssClass: 'icon-md', text: 'M' },
+                        'markdown': { cssClass: 'icon-md', text: 'M' },
+                        'py': { cssClass: 'icon-py', text: 'Py' },
+                        'xml': { cssClass: 'icon-xml', text: 'X' },
+                        'svg': { cssClass: 'icon-svg', text: '&#x2B21;' },
+                        'yml': { cssClass: 'icon-default', text: 'Y' },
+                        'yaml': { cssClass: 'icon-default', text: 'Y' },
+                        'txt': { cssClass: 'icon-default', text: '&#x1F4DD;' },
+                        'sh': { cssClass: 'icon-default', text: '$' },
+                        'gitignore': { cssClass: 'icon-git', text: 'git' }
                     };
                     
-                    return iconMap[ext] || { class: 'icon-default', text: '📄' };
+                    return iconMap[ext] || { cssClass: 'icon-default', text: '&#x1F4C4;' };
                 }
 
-                function renderTree(tree, level = 0, parentPath = '') {
-                    const entries = Object.entries(tree).sort((a, b) => {
+                function renderTree(tree, level, parentPath) {
+                    level = level || 0;
+                    parentPath = parentPath || '';
+                    
+                    const entries = Object.entries(tree).sort(function(a, b) {
                         const aIsFolder = a[1].__type === 'folder';
                         const bIsFolder = b[1].__type === 'folder';
                         if (aIsFolder && !bIsFolder) return -1;
@@ -1136,45 +1049,40 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                         return a[0].localeCompare(b[0]);
                     });
 
-                    return entries.map(([name, node]) => {
+                    return entries.map(function(entry) {
+                        const name = entry[0];
+                        const node = entry[1];
+                        
                         if (node.__type === 'folder') {
                             const folderId = 'folder-' + Math.random().toString(36).substr(2, 9);
                             const hasChildren = Object.keys(node.__children).length > 0;
                             const isMatchingFolder = node.__isMatch === true;
+                            const folderFsPath = node.__fsPath || '';
                             const folderPath = node.__path || (parentPath ? parentPath + '/' + name : name);
-                            const folderFsPath = node.__fsPath;
                             
-                            // If empty matching folder, show clickable to reveal in explorer
                             if (!hasChildren && isMatchingFolder) {
-                                return \`
-                                    <div class="folder-item" onclick="revealFolder('\${folderFsPath}')" style="cursor: pointer;" title="Click to reveal in Explorer">
-                                        <span style="width: 16px;"></span>
-                                        <span class="icon-folder" style="font-size: 16px;">📁</span>
-                                        <span>\${name}</span>
-                                        <span style="margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground);">(empty match)</span>
-                                    </div>
-                                \`;
+                                return '<div class="folder-item" data-action="revealFolder" data-path="' + escapeHtml(folderFsPath) + '" title="Click to reveal in Explorer">' +
+                                    '<span style="width: 16px;"></span>' +
+                                    '<span class="icon-folder" style="font-size: 16px;">&#x1F4C1;</span>' +
+                                    '<span>' + escapeHtml(name) + '</span>' +
+                                    '<span style="margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground);">(empty match)</span>' +
+                                    '</div>';
                             }
                             
-                            // Regular folder with children - also clickable
-                            return \`
-                                <div class="folder-item" onclick="handleFolderClick(event, '\${folderId}', '\${folderFsPath || ''}')" title="Click to expand/collapse, Alt+Click to reveal in Explorer">
-                                    <span class="icon-chevron" id="icon-\${folderId}" style="font-size: 10px;">▼</span>
-                                    <span class="icon-folder" style="font-size: 16px;">📁</span>
-                                    <span>\${name}</span>
-                                </div>
-                                <div class="folder-children expanded" id="\${folderId}">
-                                    \${renderTree(node.__children, level + 1, folderPath)}
-                                </div>
-                            \`;
+                            return '<div class="folder-item" data-action="toggleFolder" data-folder-id="' + folderId + '" data-folder-path="' + escapeHtml(folderFsPath) + '" title="Click to expand/collapse, Alt+Click to reveal in Explorer">' +
+                                '<span class="icon-chevron" id="icon-' + folderId + '" style="font-size: 10px;">&#x25BC;</span>' +
+                                '<span class="icon-folder" style="font-size: 16px;">&#x1F4C1;</span>' +
+                                '<span>' + escapeHtml(name) + '</span>' +
+                                '</div>' +
+                                '<div class="folder-children expanded" id="' + folderId + '">' +
+                                renderTree(node.__children, level + 1, folderPath) +
+                                '</div>';
                         } else {
                             const icon = getFileIcon(node.__data.fileName);
-                            return \`
-                                <div class="file-item" onclick="openFile('\${node.__data.fsPath}')">
-                                    <span class="file-icon \${icon.class}">\${icon.text}</span>
-                                    <span>\${name}</span>
-                                </div>
-                            \`;
+                            return '<div class="file-item" data-action="openFile" data-path="' + escapeHtml(node.__data.fsPath) + '">' +
+                                '<span class="file-icon ' + icon.cssClass + '">' + icon.text + '</span>' +
+                                '<span>' + escapeHtml(name) + '</span>' +
+                                '</div>';
                         }
                     }).join('');
                 }
@@ -1182,49 +1090,52 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 function toggleFolder(folderId) {
                     const folder = document.getElementById(folderId);
                     const icon = document.getElementById('icon-' + folderId);
+                    if (!folder || !icon) return;
                     
                     if (folder.classList.contains('expanded')) {
                         folder.classList.remove('expanded');
-                        icon.textContent = '▶';
+                        icon.innerHTML = '&#x25B6;';
                     } else {
                         folder.classList.add('expanded');
-                        icon.textContent = '▼';
+                        icon.innerHTML = '&#x25BC;';
                     }
                 }
 
-                function handleFolderClick(event, folderId, fsPath) {
-                    // Alt+Click to reveal in explorer
-                    if (event.altKey && fsPath) {
-                        event.stopPropagation();
-                        revealFolder(fsPath);
-                    } else {
-                        // Normal click to toggle
-                        toggleFolder(folderId);
-                    }
-                }
-
-                function revealFolder(fsPath) {
-                    if (fsPath) {
-                        vscode.postMessage({ type: 'revealFolder', fsPath });
-                    }
-                }
-
-                function openFile(fsPath) {
-                    vscode.postMessage({ type: 'openFile', fsPath });
-                }
-
-                // Initialize exclude pattern on load
-                initializeExcludePattern();
-
-                // Manejar apertura de archivos
-                window.addEventListener('message', event => {
-                    const message = event.data;
-                    if (message.type === 'openFile') {
-                        // VS Code will handle this
+                // Event delegation for dynamically rendered items
+                resultsContainer.addEventListener('click', function(e) {
+                    const item = e.target.closest('[data-action]');
+                    if (!item) return;
+                    
+                    const action = item.dataset.action;
+                    const path = item.dataset.path;
+                    
+                    if (action === 'openFile' && path) {
+                        vscode.postMessage({ type: 'openFile', fsPath: path });
+                    } else if (action === 'revealFolder' && path) {
+                        vscode.postMessage({ type: 'revealFolder', fsPath: path });
+                    } else if (action === 'toggleFolder') {
+                        if (e.altKey && item.dataset.folderPath) {
+                            vscode.postMessage({ type: 'revealFolder', fsPath: item.dataset.folderPath });
+                        } else {
+                            toggleFolder(item.dataset.folderId);
+                        }
                     }
                 });
+
+                // Initialize and notify extension we're ready
+                initializeExcludePattern();
+                vscode.postMessage({ type: 'ready' });
             </script>
         </body>
         </html>`;
     }
+}
+
+function getNonce(): string {
+    let text = '';
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+    }
+    return text;
 }

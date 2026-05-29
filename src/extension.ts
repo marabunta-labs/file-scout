@@ -2,34 +2,37 @@ import * as vscode from 'vscode';
 import { FileScoutWebviewProvider } from './fileScoutWebview';
 
 class FileScoutDecorationProvider implements vscode.FileDecorationProvider {
-    private _onDidChangeFileDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
+    private readonly _onDidChangeFileDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
     readonly onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
 
     private matchingFiles = new Set<string>();
 
     provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
-        const fsPath = uri.fsPath;
-        
-        if (this.matchingFiles.has(fsPath)) {
+        if (this.matchingFiles.has(uri.fsPath)) {
             return {
                 badge: '●',
                 color: new vscode.ThemeColor('charts.blue'),
                 tooltip: 'File Scout Match'
             };
         }
-        
         return undefined;
     }
 
-    setMatchingFiles(files: string[]) {
+    setMatchingFiles(files: string[]): void {
         this.matchingFiles.clear();
-        files.forEach(file => this.matchingFiles.add(file));
+        for (const file of files) {
+            this.matchingFiles.add(file);
+        }
         this._onDidChangeFileDecorations.fire(undefined);
     }
 
-    clearMatches() {
+    clearMatches(): void {
         this.matchingFiles.clear();
         this._onDidChangeFileDecorations.fire(undefined);
+    }
+
+    dispose(): void {
+        this._onDidChangeFileDecorations.dispose();
     }
 }
 
@@ -37,6 +40,7 @@ export function activate(context: vscode.ExtensionContext) {
     const decorationProvider = new FileScoutDecorationProvider();
     const provider = new FileScoutWebviewProvider(context.extensionUri, decorationProvider);
 
+    context.subscriptions.push(decorationProvider);
     context.subscriptions.push(
         vscode.window.registerFileDecorationProvider(decorationProvider)
     );
@@ -45,7 +49,6 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewViewProvider(FileScoutWebviewProvider.viewType, provider)
     );
 
-    // Command to open files from the webview
     context.subscriptions.push(
         vscode.commands.registerCommand('file-scout.openFile', async (fsPath: string) => {
             const uri = vscode.Uri.file(fsPath);
@@ -53,7 +56,6 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    // Command to reveal folder in explorer
     context.subscriptions.push(
         vscode.commands.registerCommand('file-scout.revealFolder', async (fsPath: string) => {
             const uri = vscode.Uri.file(fsPath);
@@ -61,17 +63,17 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-	context.subscriptions.push(
-		vscode.commands.registerCommand('file-scout.toggleMatchCase', () => {
-			provider._view?.webview.postMessage({ type: 'toggleMatchCase' });
-		}),
-		vscode.commands.registerCommand('file-scout.toggleMatchWholeWord', () => {
-			provider._view?.webview.postMessage({ type: 'toggleMatchWholeWord' });
-		}),
-		vscode.commands.registerCommand('file-scout.toggleRegex', () => {
-			provider._view?.webview.postMessage({ type: 'toggleRegex' });
-		})
-	);
+    context.subscriptions.push(
+        vscode.commands.registerCommand('file-scout.toggleMatchCase', () => {
+            provider.postMessage({ type: 'toggleMatchCase' });
+        }),
+        vscode.commands.registerCommand('file-scout.toggleMatchWholeWord', () => {
+            provider.postMessage({ type: 'toggleMatchWholeWord' });
+        }),
+        vscode.commands.registerCommand('file-scout.toggleRegex', () => {
+            provider.postMessage({ type: 'toggleRegex' });
+        })
+    );
 }
 
 export function deactivate() {}
