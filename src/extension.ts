@@ -5,7 +5,7 @@ class FileScoutDecorationProvider implements vscode.FileDecorationProvider {
     private readonly _onDidChangeFileDecorations = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
     readonly onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
 
-    private matchingFiles = new Set<string>();
+    private matchingFiles = new Map<string, vscode.Uri>();
 
     provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
         if (this.matchingFiles.has(uri.fsPath)) {
@@ -19,16 +19,28 @@ class FileScoutDecorationProvider implements vscode.FileDecorationProvider {
     }
 
     setMatchingFiles(files: string[]): void {
-        this.matchingFiles.clear();
+        const previous = this.matchingFiles;
+        const next = new Map<string, vscode.Uri>();
         for (const file of files) {
-            this.matchingFiles.add(file);
+            next.set(file, previous.get(file) ?? vscode.Uri.file(file));
         }
-        this._onDidChangeFileDecorations.fire(undefined);
+        this.matchingFiles = next;
+
+        // Only refresh the URIs whose decoration actually changed
+        const changed: vscode.Uri[] = [];
+        for (const [key, uri] of next) {
+            if (!previous.has(key)) { changed.push(uri); }
+        }
+        for (const [key, uri] of previous) {
+            if (!next.has(key)) { changed.push(uri); }
+        }
+        if (changed.length > 0) {
+            this._onDidChangeFileDecorations.fire(changed);
+        }
     }
 
     clearMatches(): void {
-        this.matchingFiles.clear();
-        this._onDidChangeFileDecorations.fire(undefined);
+        this.setMatchingFiles([]);
     }
 
     dispose(): void {
@@ -40,30 +52,36 @@ export function activate(context: vscode.ExtensionContext) {
     const decorationProvider = new FileScoutDecorationProvider();
     const provider = new FileScoutWebviewProvider(context.extensionUri, decorationProvider);
 
-    context.subscriptions.push(decorationProvider);
+    context.subscriptions.push(decorationProvider, provider);
     context.subscriptions.push(
         vscode.window.registerFileDecorationProvider(decorationProvider)
     );
 
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(FileScoutWebviewProvider.viewType, provider)
-    );
-
-    context.subscriptions.push(
-        vscode.commands.registerCommand('file-scout.openFile', async (fsPath: string) => {
-            const uri = vscode.Uri.file(fsPath);
-            await vscode.window.showTextDocument(uri);
+        vscode.window.registerWebviewViewProvider(FileScoutWebviewProvider.viewType, provider, {
+            webviewOptions: { retainContextWhenHidden: true }
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('file-scout.revealFolder', async (fsPath: string) => {
-            const uri = vscode.Uri.file(fsPath);
-            await vscode.commands.executeCommand('revealInExplorer', uri);
+        vscode.commands.registerCommand('file-scout.openFile', async (fsPath?: string) => {
+            if (!fsPath) { return; }
+            await provider.openFile(fsPath);
         })
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('file-scout.revealFolder', async (fsPath?: string) => {
+            if (!fsPath) { return; }
+            await provider.revealFolder(fsPath);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('file-scout.focus', async () => {
+            await vscode.commands.executeCommand(`${FileScoutWebviewProvider.viewType}.focus`);
+            provider.postMessage({ type: 'focusInput' });
+        }),
         vscode.commands.registerCommand('file-scout.toggleMatchCase', () => {
             provider.postMessage({ type: 'toggleMatchCase' });
         }),

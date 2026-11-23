@@ -10,13 +10,13 @@ File Scout is a powerful VS Code extension that enhances your file navigation ex
 
 ### 🎯 Advanced Search Options
 
-Search by **filename or folder name** with mutually exclusive options:
+Search by **filename or folder name**:
 
 - **Match Case (Aa)**: Case-sensitive search - find exactly what you're looking for
 - **Match Whole Word (Ab)**: Match complete filenames before the extension
 - **Regular Expression (.*)**: Use powerful regex patterns for complex searches
 
-**Note:** Only one search option can be active at a time for precise control.
+**Note:** Whole Word and Regex are mutually exclusive; Match Case combines with either. Shortcuts: `Ctrl+Alt+C` / `Ctrl+Alt+W` / `Ctrl+Alt+R` (`Cmd+Alt+…` on macOS). Include/exclude fields accept comma-separated globs, and the `fileScout.maxFiles` setting caps how many files are scanned.
 
 ### 📁 Smart File & Folder Filtering
 

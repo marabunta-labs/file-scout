@@ -1,16 +1,9 @@
 import * as vscode from 'vscode';
+import { SearchOptions, buildSearchPattern, toGlob } from './searchUtils';
 
 interface FileDecorationProvider {
     setMatchingFiles(files: string[]): void;
     clearMatches(): void;
-}
-
-interface SearchOptions {
-    matchCase?: boolean;
-    matchWholeWord?: boolean;
-    useRegex?: boolean;
-    filesToInclude?: string;
-    filesToExclude?: string;
 }
 
 interface FileResult {
@@ -20,22 +13,58 @@ interface FileResult {
     isFolder?: boolean;
 }
 
-export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
+export class FileScoutWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
     public static readonly viewType = 'fileScoutView';
     private _view?: vscode.WebviewView;
-    private _lastQuery = '';
-    private _lastOptions: SearchOptions = {};
-    private _lastResults: FileResult[] = [];
-    private _webviewReady = false;
     private _searchGeneration = 0;
+    private _searchCts?: vscode.CancellationTokenSource;
+    private _fileCache?: { key: string; files: vscode.Uri[]; truncated: boolean };
+    private readonly _disposables: vscode.Disposable[] = [];
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _decorationProvider: FileDecorationProvider
-    ) { }
+    ) {
+        // The cached file list is only valid until the workspace layout changes
+        const watcher = vscode.workspace.createFileSystemWatcher('**/*', false, true, false);
+        const invalidate = () => { this._fileCache = undefined; };
+        this._disposables.push(
+            watcher,
+            watcher.onDidCreate(invalidate),
+            watcher.onDidDelete(invalidate),
+            vscode.workspace.onDidChangeWorkspaceFolders(invalidate),
+            vscode.workspace.onDidChangeConfiguration(e => {
+                if (e.affectsConfiguration('fileScout') || e.affectsConfiguration('files.exclude')) {
+                    invalidate();
+                }
+            })
+        );
+    }
+
+    public dispose(): void {
+        this._searchCts?.cancel();
+        this._searchCts?.dispose();
+        this._disposables.forEach(d => d.dispose());
+    }
 
     public postMessage(message: unknown): void {
         this._view?.webview.postMessage(message);
+    }
+
+    public async openFile(fsPath: string): Promise<void> {
+        try {
+            await vscode.window.showTextDocument(vscode.Uri.file(fsPath));
+        } catch (error) {
+            vscode.window.showErrorMessage(`File Scout: could not open "${fsPath}" (${error instanceof Error ? error.message : error}).`);
+        }
+    }
+
+    public async revealFolder(fsPath: string): Promise<void> {
+        try {
+            await vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(fsPath));
+        } catch (error) {
+            vscode.window.showErrorMessage(`File Scout: could not reveal "${fsPath}" (${error instanceof Error ? error.message : error}).`);
+        }
     }
 
     public resolveWebviewView(
@@ -44,7 +73,6 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
         _token: vscode.CancellationToken,
     ) {
         this._view = webviewView;
-        this._webviewReady = false;
 
         webviewView.webview.options = {
             enableScripts: true,
@@ -53,38 +81,29 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
-        webviewView.onDidChangeVisibility(() => {
-            if (webviewView.visible && this._lastResults.length > 0) {
-                this._restoreState();
+        webviewView.onDidDispose(() => {
+            if (this._view === webviewView) {
+                this._view = undefined;
             }
+            this._searchGeneration++;
+            this._searchCts?.cancel();
+            this._decorationProvider.clearMatches();
         });
 
         webviewView.webview.onDidReceiveMessage(async data => {
-            switch (data.type) {
-                case 'ready':
-                    this._webviewReady = true;
-                    if (this._lastResults.length > 0 || this._lastQuery) {
-                        this._restoreState();
-                    }
-                    break;
+            switch (data?.type) {
                 case 'search':
-                    this._lastQuery = data.query;
-                    this._lastOptions = data.options || {};
-                    await this._performSearch(data.query, data.options);
+                    await this._performSearch(String(data.query ?? ''), data.options);
                     break;
-                case 'openFile': {
-                    const uri = vscode.Uri.file(data.fsPath);
-                    await vscode.window.showTextDocument(uri);
+                case 'openFile':
+                    if (typeof data.fsPath === 'string') { await this.openFile(data.fsPath); }
                     break;
-                }
-                case 'revealFolder': {
-                    const folderUri = vscode.Uri.file(data.fsPath);
-                    await vscode.commands.executeCommand('revealInExplorer', folderUri);
+                case 'revealFolder':
+                    if (typeof data.fsPath === 'string') { await this.revealFolder(data.fsPath); }
                     break;
-                }
                 case 'openInEditor': {
                     const document = await vscode.workspace.openTextDocument({
-                        content: data.content,
+                        content: String(data.content ?? ''),
                         language: 'markdown'
                     });
                     await vscode.window.showTextDocument(document);
@@ -94,124 +113,105 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private _restoreState(): void {
-        if (!this._webviewReady) { return; }
-        const matchingFilePaths = this._lastResults
-            .filter(r => !r.isFolder)
-            .map(r => r.fsPath);
-        this._decorationProvider.setMatchingFiles(matchingFilePaths);
+    private _postResults(files: FileResult[], extra: { message?: string; truncated?: boolean } = {}): void {
+        this._view?.webview.postMessage({ type: 'results', files, ...extra });
+    }
 
-        this._view?.webview.postMessage({
-            type: 'restore',
-            query: this._lastQuery,
-            options: this._lastOptions,
-            files: this._lastResults
-        });
+    private async _findFiles(
+        include: string,
+        exclude: string | undefined,
+        token: vscode.CancellationToken
+    ): Promise<{ files: vscode.Uri[]; truncated: boolean } | undefined> {
+        const maxResults = vscode.workspace.getConfiguration('fileScout').get<number>('maxFiles', 10000);
+        const key = `${include}\u0000${exclude ?? ''}\u0000${maxResults}`;
+        if (this._fileCache?.key === key) {
+            return this._fileCache;
+        }
+
+        const files = await vscode.workspace.findFiles(include, exclude, maxResults, token);
+        if (token.isCancellationRequested) { return undefined; }
+
+        this._fileCache = { key, files, truncated: files.length >= maxResults };
+        return this._fileCache;
     }
 
     private async _performSearch(query: string, options?: SearchOptions): Promise<void> {
         const generation = ++this._searchGeneration;
+        this._searchCts?.cancel();
+        this._searchCts?.dispose();
+        const cts = this._searchCts = new vscode.CancellationTokenSource();
 
-        if (!query || query.trim() === '') {
+        if (query.trim() === '') {
             this._decorationProvider.clearMatches();
-            this._lastResults = [];
-            this._view?.webview.postMessage({ type: 'results', files: [] });
+            this._postResults([]);
             return;
         }
 
-        const includePattern = options?.filesToInclude || '**/*';
-        const excludePattern = options?.filesToExclude || undefined;
+        const searchPattern = buildSearchPattern(query, options);
+        if (!searchPattern) {
+            this._decorationProvider.clearMatches();
+            this._postResults([], { message: 'Invalid regular expression' });
+            return;
+        }
 
         try {
-            const foundFiles = await vscode.workspace.findFiles(
-                includePattern,
-                excludePattern,
-                2000
+            const found = await this._findFiles(
+                toGlob(options?.filesToInclude) ?? '**/*',
+                toGlob(options?.filesToExclude),
+                cts.token
             );
 
-            let searchPattern: RegExp;
-            try {
-                if (options?.useRegex) {
-                    const flags = options?.matchCase ? '' : 'i';
-                    searchPattern = new RegExp(query, flags);
-                } else {
-                    let escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            // Discard stale results if a newer search was started
+            if (!found || generation !== this._searchGeneration) { return; }
 
-                    if (options?.matchWholeWord) {
-                        escapedQuery = `^${escapedQuery}(\\.|$)`;
-                    }
+            const multiRoot = (vscode.workspace.workspaceFolders?.length ?? 0) > 1;
+            const fileResults: FileResult[] = [];
+            const folderResults = new Map<string, FileResult>();
 
-                    const flags = options?.matchCase ? '' : 'i';
-                    searchPattern = new RegExp(escapedQuery, flags);
-                }
-            } catch {
-                if (generation !== this._searchGeneration) { return; }
-                this._lastResults = [];
-                this._view?.webview.postMessage({ type: 'results', files: [] });
-                return;
-            }
-
-            const results: FileResult[] = [];
-            const matchingFolderPaths = new Set<string>();
-
-            // First pass: find matching folders
-            for (const uri of foundFiles) {
-                const relativePath = vscode.workspace.asRelativePath(uri);
-                const pathParts = relativePath.split('/');
-
-                for (let i = 0; i < pathParts.length - 1; i++) {
-                    if (searchPattern.test(pathParts[i])) {
-                        const folderPath = pathParts.slice(0, i + 1).join('/');
-                        matchingFolderPaths.add(folderPath);
-                    }
-                }
-            }
-
-            // Second pass: find matching files
-            for (const uri of foundFiles) {
-                const relativePath = vscode.workspace.asRelativePath(uri);
-                const fileName = uri.path.split('/').pop() || '';
+            for (const uri of found.files) {
+                const folder = vscode.workspace.getWorkspaceFolder(uri);
+                const relativePath = vscode.workspace.asRelativePath(uri, false);
+                const prefix = multiRoot && folder ? `${folder.name}/` : '';
+                const parts = relativePath.split('/');
+                const fileName = parts[parts.length - 1];
 
                 if (searchPattern.test(fileName)) {
-                    results.push({
-                        path: relativePath,
+                    fileResults.push({
+                        path: prefix + relativePath,
                         fsPath: uri.fsPath,
                         fileName
                     });
                 }
-            }
 
-            // Third pass: add matching folders
-            const workspaceFolders = vscode.workspace.workspaceFolders;
-            if (workspaceFolders && workspaceFolders.length > 0) {
-                for (const folderPath of matchingFolderPaths) {
-                    const folderUri = vscode.Uri.joinPath(workspaceFolders[0].uri, folderPath);
-                    results.push({
-                        path: folderPath,
-                        fsPath: folderUri.fsPath,
-                        fileName: folderPath.split('/').pop() || folderPath,
-                        isFolder: true
-                    });
+                // Folders: every ancestor directory whose name matches
+                if (!folder) { continue; }
+                for (let i = 0; i < parts.length - 1; i++) {
+                    if (!searchPattern.test(parts[i])) { continue; }
+                    const folderUri = vscode.Uri.joinPath(folder.uri, ...parts.slice(0, i + 1));
+                    if (!folderResults.has(folderUri.fsPath)) {
+                        folderResults.set(folderUri.fsPath, {
+                            path: prefix + parts.slice(0, i + 1).join('/'),
+                            fsPath: folderUri.fsPath,
+                            fileName: parts[i],
+                            isFolder: true
+                        });
+                    }
                 }
             }
 
-            // Discard stale results if a newer search was started
-            if (generation !== this._searchGeneration) { return; }
+            const byPath = (a: FileResult, b: FileResult) => a.path.localeCompare(b.path);
+            const results = [
+                ...[...folderResults.values()].sort(byPath),
+                ...fileResults.sort(byPath)
+            ];
 
-            // Update decorations
-            const matchingFilePaths = results
-                .filter(r => !r.isFolder)
-                .map(r => r.fsPath);
-            this._decorationProvider.setMatchingFiles(matchingFilePaths);
-
-            this._lastResults = results;
-            this._view?.webview.postMessage({ type: 'results', files: results });
+            this._decorationProvider.setMatchingFiles(fileResults.map(r => r.fsPath));
+            this._postResults(results, { truncated: found.truncated });
         } catch (error) {
             if (generation !== this._searchGeneration) { return; }
             console.error('File Scout search error:', error);
             this._decorationProvider.clearMatches();
-            this._lastResults = [];
-            this._view?.webview.postMessage({ type: 'results', files: [] });
+            this._postResults([], { message: `Search failed: ${error instanceof Error ? error.message : error}` });
         }
     }
 
@@ -455,6 +455,10 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     align-items: center;
                     font-size: 13px;
                 }
+                .file-item:focus-visible, .folder-item:focus-visible, .list-item:focus-visible {
+                    outline: 1px solid var(--vscode-focusBorder);
+                    outline-offset: -1px;
+                }
                 .file-item:hover {
                     background: var(--vscode-list-hoverBackground);
                 }
@@ -518,24 +522,25 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                         class="search-input" 
                         id="searchInput"
                         placeholder="Search files and folders by name..."
+                        aria-label="Search files and folders by name"
                         autofocus
                     />
                     <div class="search-options">
                         <button 
                             class="option-button" 
                             id="btnMatchCase"
-                            title="Match Case (Alt+C)"
+                            title="Match Case (Ctrl+Alt+C / Cmd+Alt+C)" aria-label="Match Case" aria-pressed="false"
                         >Aa</button>
                         <button 
                             class="option-button" 
                             id="btnMatchWord"
-                            title="Match Whole Word: match exact filename (Alt+W)"
-                            aria-label="Match Whole Word"
+                            title="Match Whole Word: match exact filename (Ctrl+Alt+W / Cmd+Alt+W)"
+                            aria-label="Match Whole Word" aria-pressed="false"
                         >Ab</button>
                         <button 
                             class="option-button" 
                             id="btnUseRegex"
-                            title="Use Regular Expression (Alt+R)"
+                            title="Use Regular Expression (Ctrl+Alt+R / Cmd+Alt+R)" aria-label="Use Regular Expression" aria-pressed="false"
                         >.*</button>
                     </div>
                 </div>
@@ -594,7 +599,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                             type="text" 
                             class="filter-input" 
                             id="filesToExclude"
-                            placeholder="Custom pattern: e.g., **/*.test.ts"
+                            placeholder="Custom patterns: e.g., **/*.test.ts, docs/**"
                         />
                     </div>
                 </div>
@@ -636,16 +641,25 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 let currentFiles = [];
 
                 function escapeHtml(str) {
-                    const div = document.createElement('div');
-                    div.textContent = str;
-                    return div.innerHTML;
+                    return String(str)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#39;');
+                }
+
+                function applyViewModeButton() {
+                    const btn = document.getElementById('btnViewToggle');
+                    btn.innerHTML = viewMode === 'tree' ? '&#x1F333;' : '&#x1F4C4;';
+                    btn.title = viewMode === 'tree' ? 'Switch to List View' : 'Switch to Tree View';
+                    btn.setAttribute('aria-label', btn.title);
                 }
 
                 function toggleViewMode() {
                     viewMode = viewMode === 'tree' ? 'list' : 'tree';
-                    const btn = document.getElementById('btnViewToggle');
-                    btn.innerHTML = viewMode === 'tree' ? '&#x1F333;' : '&#x1F4C4;';
-                    btn.title = viewMode === 'tree' ? 'Switch to List View' : 'Switch to Tree View';
+                    applyViewModeButton();
+                    saveState();
                     
                     if (currentFiles.length > 0) {
                         displayResults(currentFiles);
@@ -682,10 +696,6 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     vscode.postMessage({ type: 'openInEditor', content: content });
                 }
 
-                function initializeExcludePattern() {
-                    updateExcludePattern();
-                }
-
                 function toggleExcludeOptions(evt) {
                     const checkboxesDiv = document.getElementById('excludeCheckboxes');
                     const toggle = evt.currentTarget;
@@ -719,57 +729,75 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                         excludePatterns.push(customPattern);
                     }
                     
-                    let combinedPattern = '';
-                    if (excludePatterns.length > 1) {
-                        combinedPattern = '{' + excludePatterns.join(',') + '}';
-                    } else if (excludePatterns.length === 1) {
-                        combinedPattern = excludePatterns[0];
-                    }
-                    filesToExclude.dataset.effectivePattern = combinedPattern;
+                    filesToExclude.dataset.effectivePattern = excludePatterns.join(', ');
+                    saveState();
                     
                     if (searchInput.value.trim()) {
                         performSearch();
                     }
                 }
 
+                function syncOptionButtons() {
+                    [['btnMatchCase', 'matchCase'], ['btnMatchWord', 'matchWholeWord'], ['btnUseRegex', 'useRegex']].forEach(function(pair) {
+                        const btn = document.getElementById(pair[0]);
+                        btn.classList.toggle('active', !!searchOptions[pair[1]]);
+                        btn.setAttribute('aria-pressed', searchOptions[pair[1]] ? 'true' : 'false');
+                    });
+                }
+
                 function toggleOption(option) {
-                    if (option === 'useRegex') {
-                        if (searchOptions.useRegex) {
-                            searchOptions.useRegex = false;
-                            document.getElementById('btnUseRegex').classList.remove('active');
-                        } else {
-                            searchOptions.useRegex = true;
-                            searchOptions.matchWholeWord = false;
-                            document.getElementById('btnUseRegex').classList.add('active');
-                            document.getElementById('btnMatchWord').classList.remove('active');
-                        }
-                    } else if (option === 'matchWholeWord') {
-                        if (searchOptions.matchWholeWord) {
-                            searchOptions.matchWholeWord = false;
-                            document.getElementById('btnMatchWord').classList.remove('active');
-                        } else {
-                            searchOptions.matchWholeWord = true;
-                            searchOptions.useRegex = false;
-                            document.getElementById('btnMatchWord').classList.add('active');
-                            document.getElementById('btnUseRegex').classList.remove('active');
-                        }
-                    } else if (option === 'matchCase') {
-                        searchOptions.matchCase = !searchOptions.matchCase;
-                        if (searchOptions.matchCase) {
-                            document.getElementById('btnMatchCase').classList.add('active');
-                        } else {
-                            document.getElementById('btnMatchCase').classList.remove('active');
-                        }
+                    searchOptions[option] = !searchOptions[option];
+                    // Regex and whole word are mutually exclusive
+                    if (searchOptions[option]) {
+                        if (option === 'useRegex') { searchOptions.matchWholeWord = false; }
+                        if (option === 'matchWholeWord') { searchOptions.useRegex = false; }
                     }
-                    
+                    syncOptionButtons();
                     performSearch();
+                }
+
+                const EXCLUDE_IDS = ['node-modules', 'dist', 'build', 'out', 'git', 'vscode', 'coverage', 'temp'];
+
+                function saveState() {
+                    const excludes = {};
+                    EXCLUDE_IDS.forEach(function(id) {
+                        excludes[id] = document.getElementById('exclude-' + id).checked;
+                    });
+                    vscode.setState({
+                        query: searchInput.value,
+                        options: searchOptions,
+                        include: filesToInclude.value,
+                        exclude: filesToExclude.value,
+                        excludes: excludes,
+                        viewMode: viewMode,
+                        filtersExpanded: document.getElementById('filterInputs').classList.contains('expanded')
+                    });
+                }
+
+                function loadState() {
+                    const state = vscode.getState();
+                    if (!state) return;
+                    searchInput.value = state.query || '';
+                    searchOptions = Object.assign({ matchCase: false, matchWholeWord: false, useRegex: false }, state.options);
+                    filesToInclude.value = state.include || '';
+                    filesToExclude.value = state.exclude || '';
+                    EXCLUDE_IDS.forEach(function(id) {
+                        if (state.excludes && id in state.excludes) {
+                            document.getElementById('exclude-' + id).checked = !!state.excludes[id];
+                        }
+                    });
+                    if (state.viewMode === 'list') { viewMode = 'list'; applyViewModeButton(); }
+                    if (state.filtersExpanded) { document.getElementById('filterInputs').classList.add('expanded'); }
+                    syncOptionButtons();
                 }
 
                 function toggleFilters() {
                     document.getElementById('filterInputs').classList.toggle('expanded');
+                    saveState();
                 }
 
                 function performSearch() {
+                    saveState();
                     const query = searchInput.value;
                     const effectiveExclude = filesToExclude.dataset.effectivePattern || '';
                     vscode.postMessage({ 
@@ -790,7 +818,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     searchTimeout = setTimeout(performSearch, 300);
                 });
 
-                searchInput.addEventListener('keypress', function(e) {
+                searchInput.addEventListener('keydown', function(e) {
                     if (e.key === 'Enter') {
                         clearTimeout(searchTimeout);
                         performSearch();
@@ -800,6 +828,15 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 filesToInclude.addEventListener('input', function() {
                     clearTimeout(searchTimeout);
                     searchTimeout = setTimeout(performSearch, 500);
+                });
+
+                [filesToInclude, filesToExclude].forEach(function(input) {
+                    input.addEventListener('keydown', function(e) {
+                        if (e.key === 'Enter') {
+                            clearTimeout(searchTimeout);
+                            if (input === filesToExclude) { updateExcludePattern(); } else { performSearch(); }
+                        }
+                    });
                 });
 
                 filesToExclude.addEventListener('input', function() {
@@ -820,22 +857,6 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     cb.addEventListener('change', updateExcludePattern);
                 });
 
-                // Keyboard shortcuts
-                document.addEventListener('keydown', function(e) {
-                    if (e.altKey) {
-                        if (e.key === 'c' || e.key === 'C') {
-                            e.preventDefault();
-                            toggleOption('matchCase');
-                        } else if (e.key === 'w' || e.key === 'W') {
-                            e.preventDefault();
-                            toggleOption('matchWholeWord');
-                        } else if (e.key === 'r' || e.key === 'R') {
-                            e.preventDefault();
-                            toggleOption('useRegex');
-                        }
-                    }
-                });
-
                 window.addEventListener('message', function(event) {
                     const message = event.data;
                     if (message.type === 'toggleMatchCase') {
@@ -844,59 +865,22 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                         toggleOption('matchWholeWord');
                     } else if (message.type === 'toggleRegex') {
                         toggleOption('useRegex');
+                    } else if (message.type === 'focusInput') {
+                        searchInput.focus();
+                        searchInput.select();
                     } else if (message.type === 'results') {
-                        displayResults(message.files);
-                    } else if (message.type === 'restore') {
-                        searchInput.value = message.query || '';
-                        
-                        document.querySelectorAll('.option-button.active').forEach(function(btn) {
-                            btn.classList.remove('active');
-                        });
-                        
-                        searchOptions = { matchCase: false, matchWholeWord: false, useRegex: false };
-                        
-                        if (message.options) {
-                            if (message.options.matchCase) {
-                                searchOptions.matchCase = true;
-                                document.getElementById('btnMatchCase').classList.add('active');
-                            }
-                            if (message.options.matchWholeWord) {
-                                searchOptions.matchWholeWord = true;
-                                document.getElementById('btnMatchWord').classList.add('active');
-                            }
-                            if (message.options.useRegex) {
-                                searchOptions.useRegex = true;
-                                document.getElementById('btnUseRegex').classList.add('active');
-                            }
-                            if (message.options.filesToInclude) {
-                                filesToInclude.value = message.options.filesToInclude;
-                            }
-                            if (message.options.filesToExclude) {
-                                const excludePattern = message.options.filesToExclude;
-                                document.getElementById('exclude-node-modules').checked = excludePattern.includes('node_modules');
-                                document.getElementById('exclude-dist').checked = excludePattern.includes('**/dist/**');
-                                document.getElementById('exclude-build').checked = excludePattern.includes('**/build/**');
-                                document.getElementById('exclude-out').checked = excludePattern.includes('**/out/**');
-                                document.getElementById('exclude-git').checked = excludePattern.includes('.git');
-                                document.getElementById('exclude-vscode').checked = excludePattern.includes('.vscode');
-                                document.getElementById('exclude-coverage').checked = excludePattern.includes('**/coverage/**');
-                                document.getElementById('exclude-temp').checked = excludePattern.includes('**/temp/**') || excludePattern.includes('**/tmp/**');
-                                filesToExclude.dataset.effectivePattern = excludePattern;
-                            }
-                        }
-                        
-                        if (message.files && message.files.length > 0) {
-                            displayResults(message.files);
-                        }
+                        displayResults(message.files, message.message, message.truncated);
                     }
                 });
 
-                function displayResults(files) {
+                function displayResults(files, message, truncated) {
                     currentFiles = files;
                     
                     if (files.length === 0) {
                         updateResultsCount([]);
-                        if (searchInput.value.trim() === '') {
+                        if (message) {
+                            resultsContainer.innerHTML = '<div class="no-results">' + escapeHtml(message) + '</div>';
+                        } else if (searchInput.value.trim() === '') {
                             resultsContainer.innerHTML = '<div class="welcome">&#x1F50D; Search for files and folders by name</div>';
                         } else {
                             resultsContainer.innerHTML = '<div class="no-results">No files found</div>';
@@ -905,6 +889,9 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     }
 
                     updateResultsCount(files);
+                    if (truncated) {
+                        document.getElementById('resultsCount').textContent += ' (workspace scan limit reached)';
+                    }
 
                     if (viewMode === 'tree') {
                         const tree = buildFileTree(files);
@@ -917,14 +904,14 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 function renderList(files) {
                     return files.map(function(file) {
                         if (file.isFolder) {
-                            return '<div class="list-item" data-action="revealFolder" data-path="' + escapeHtml(file.fsPath) + '" title="Click to reveal in Explorer">' +
+                            return '<div class="list-item" tabindex="0" role="button" data-action="revealFolder" data-path="' + escapeHtml(file.fsPath) + '" title="Click to reveal in Explorer">' +
                                 '<span class="icon-folder" style="font-size: 16px;">&#x1F4C1;</span>' +
                                 '<span>' + escapeHtml(file.fileName) + '</span>' +
                                 '<span class="list-item-path">' + escapeHtml(file.path) + '</span>' +
                                 '</div>';
                         } else {
                             const icon = getFileIcon(file.fileName);
-                            return '<div class="list-item" data-action="openFile" data-path="' + escapeHtml(file.fsPath) + '" title="Click to open file">' +
+                            return '<div class="list-item" tabindex="0" role="button" data-action="openFile" data-path="' + escapeHtml(file.fsPath) + '" title="Click to open file">' +
                                 '<span class="file-icon ' + icon.cssClass + '">' + icon.text + '</span>' +
                                 '<span>' + escapeHtml(file.fileName) + '</span>' +
                                 '<span class="list-item-path">' + escapeHtml(file.path) + '</span>' +
@@ -936,10 +923,13 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 function buildFileTree(files) {
                     const tree = {};
                     
-                    let workspaceBasePath = '';
-                    if (files.length > 0) {
-                        const first = files[0];
-                        workspaceBasePath = first.fsPath.substring(0, first.fsPath.length - first.path.length);
+                    // fsPath of the ancestor 'levelsUp' directories above a given fsPath
+                    function ancestorFsPath(fsPath, levelsUp) {
+                        let p = fsPath;
+                        for (let k = 0; k < levelsUp; k++) {
+                            p = p.substring(0, Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\\\')));
+                        }
+                        return p;
                     }
                     
                     files.forEach(function(file) {
@@ -950,7 +940,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                             for (let i = 0; i < parts.length; i++) {
                                 const folder = parts[i];
                                 const folderPath = parts.slice(0, i + 1).join('/');
-                                const folderFsPath = workspaceBasePath + folderPath;
+                                const folderFsPath = ancestorFsPath(file.fsPath, parts.length - 1 - i);
                                 
                                 if (!current[folder]) {
                                     current[folder] = { 
@@ -974,7 +964,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                             for (let i = 0; i < parts.length - 1; i++) {
                                 const folder = parts[i];
                                 currentPath = currentPath ? currentPath + '/' + folder : folder;
-                                const folderFsPath = workspaceBasePath + currentPath;
+                                const folderFsPath = ancestorFsPath(file.fsPath, parts.length - 1 - i);
                                 
                                 if (!current[folder]) {
                                     current[folder] = { 
@@ -997,7 +987,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                 }
 
                 function getFileIcon(fileName) {
-                    const ext = (fileName.split('.').pop() || '').toLowerCase();
+                    const ext = fileName.includes('.') ? (fileName.split('.').pop() || '').toLowerCase() : '';
                     const lowerFileName = fileName.toLowerCase();
                     
                     if (lowerFileName === 'package.json') return { cssClass: 'icon-json', text: '&#x1F4E6;' };
@@ -1061,15 +1051,15 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                             const folderPath = node.__path || (parentPath ? parentPath + '/' + name : name);
                             
                             if (!hasChildren && isMatchingFolder) {
-                                return '<div class="folder-item" data-action="revealFolder" data-path="' + escapeHtml(folderFsPath) + '" title="Click to reveal in Explorer">' +
+                                return '<div class="folder-item" tabindex="0" role="button" data-action="revealFolder" data-path="' + escapeHtml(folderFsPath) + '" title="Click to reveal in Explorer">' +
                                     '<span style="width: 16px;"></span>' +
                                     '<span class="icon-folder" style="font-size: 16px;">&#x1F4C1;</span>' +
                                     '<span>' + escapeHtml(name) + '</span>' +
-                                    '<span style="margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground);">(empty match)</span>' +
+                                    '<span style="margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground);">(folder match)</span>' +
                                     '</div>';
                             }
                             
-                            return '<div class="folder-item" data-action="toggleFolder" data-folder-id="' + folderId + '" data-folder-path="' + escapeHtml(folderFsPath) + '" title="Click to expand/collapse, Alt+Click to reveal in Explorer">' +
+                            return '<div class="folder-item" tabindex="0" role="button" data-action="toggleFolder" data-folder-id="' + folderId + '" data-folder-path="' + escapeHtml(folderFsPath) + '" title="Click to expand/collapse, Alt+Click to reveal in Explorer">' +
                                 '<span class="icon-chevron" id="icon-' + folderId + '" style="font-size: 10px;">&#x25BC;</span>' +
                                 '<span class="icon-folder" style="font-size: 16px;">&#x1F4C1;</span>' +
                                 '<span>' + escapeHtml(name) + '</span>' +
@@ -1079,7 +1069,7 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                                 '</div>';
                         } else {
                             const icon = getFileIcon(node.__data.fileName);
-                            return '<div class="file-item" data-action="openFile" data-path="' + escapeHtml(node.__data.fsPath) + '">' +
+                            return '<div class="file-item" tabindex="0" role="button" data-action="openFile" data-path="' + escapeHtml(node.__data.fsPath) + '">' +
                                 '<span class="file-icon ' + icon.cssClass + '">' + icon.text + '</span>' +
                                 '<span>' + escapeHtml(name) + '</span>' +
                                 '</div>';
@@ -1100,6 +1090,13 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                         icon.innerHTML = '&#x25BC;';
                     }
                 }
+
+                resultsContainer.addEventListener('keydown', function(e) {
+                    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches && e.target.matches('[data-action]')) {
+                        e.preventDefault();
+                        e.target.click();
+                    }
+                });
 
                 // Event delegation for dynamically rendered items
                 resultsContainer.addEventListener('click', function(e) {
@@ -1122,9 +1119,10 @@ export class FileScoutWebviewProvider implements vscode.WebviewViewProvider {
                     }
                 });
 
-                // Initialize and notify extension we're ready
-                initializeExcludePattern();
-                vscode.postMessage({ type: 'ready' });
+                // Restore the previous UI state (survives the webview being re-created) and re-run the search
+                loadState();
+                updateExcludePattern(); // also runs the restored search, if any
+                searchInput.focus();
             </script>
         </body>
         </html>`;

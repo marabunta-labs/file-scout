@@ -2,7 +2,7 @@
   "name": "file-scout",
   "displayName": "File Scout",
   "description": "Advanced search and intelligent filtering of files in VS Code Explorer. Find files quickly with Match Case, Regex, and smart exclude patterns.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "icon": "media/icon.png",
   "publisher": "Marabunta",
   "keywords": [
@@ -40,27 +40,30 @@
           "id": "fileScoutView",
           "name": "File Scout",
           "visibility": "visible",
-          "when": "explorerViewletVisible",
-          "retainContextWhenHidden": true
+          "when": "explorerViewletVisible"
         }
       ]
     },
     "commands": [
       {
+        "command": "file-scout.focus",
+        "title": "File Scout: Focus Search"
+      },
+      {
         "command": "file-scout.openFile",
         "title": "File Scout: Open File"
       },
-      { 
-        "command": "file-scout.toggleMatchCase", 
-        "title": "Toggle Match Case" 
+      {
+        "command": "file-scout.toggleMatchCase",
+        "title": "File Scout: Toggle Match Case"
       },
-      { 
-        "command": "file-scout.toggleMatchWholeWord", 
-        "title": "Toggle Whole Word" 
+      {
+        "command": "file-scout.toggleMatchWholeWord",
+        "title": "File Scout: Toggle Whole Word"
       },
-      { 
-        "command": "file-scout.toggleRegex", 
-        "title": "Toggle Regex" 
+      {
+        "command": "file-scout.toggleRegex",
+        "title": "File Scout: Toggle Regex"
       }
     ],
     "keybindings": [
@@ -79,7 +82,26 @@
         "key": "ctrl+alt+r",
         "mac": "cmd+alt+r"
       }
-    ]
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "file-scout.openFile",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "File Scout",
+      "properties": {
+        "fileScout.maxFiles": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 100,
+          "description": "Maximum number of workspace files scanned per search."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
